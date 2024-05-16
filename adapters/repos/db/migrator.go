@@ -29,6 +29,7 @@ import (
 	"github.com/weaviate/weaviate/entities/schema"
 	schemaConfig "github.com/weaviate/weaviate/entities/schema/config"
 	"github.com/weaviate/weaviate/entities/storobj"
+	"github.com/weaviate/weaviate/entities/vectorindex"
 	"github.com/weaviate/weaviate/usecases/replica"
 	schemaUC "github.com/weaviate/weaviate/usecases/schema"
 	"github.com/weaviate/weaviate/usecases/sharding"
@@ -62,10 +63,12 @@ func (m *Migrator) AddClass(ctx context.Context, class *models.Class,
 			MemtablesMaxSizeMB:        m.db.config.MemtablesMaxSizeMB,
 			MemtablesMinActiveSeconds: m.db.config.MemtablesMinActiveSeconds,
 			MemtablesMaxActiveSeconds: m.db.config.MemtablesMaxActiveSeconds,
+			MaxSegmentSize:            m.db.config.MaxSegmentSize,
+			HNSWMaxLogSize:            m.db.config.HNSWMaxLogSize,
 			TrackVectorDimensions:     m.db.config.TrackVectorDimensions,
 			AvoidMMap:                 m.db.config.AvoidMMap,
 			DisableLazyLoadShards:     m.db.config.DisableLazyLoadShards,
-			ReplicationFactor:         class.ReplicationConfig.Factor,
+			ReplicationFactor:         NewAtomicInt64(class.ReplicationConfig.Factor),
 		},
 		shardState,
 		// no backward-compatibility check required, since newly added classes will
@@ -345,20 +348,29 @@ func (m *Migrator) UpdateTenants(ctx context.Context, class *models.Class, updat
 		for _, name := range updatesCold {
 			name := name
 			eg.Go(func() error {
-				idx.shardCreateLocks.Lock(name)
-				defer idx.shardCreateLocks.Unlock(name)
+				shard := func() ShardLike {
+					idx.shardInUseLocks.Lock(name)
+					defer idx.shardInUseLocks.Unlock(name)
 
-				shard, ok := idx.shards.Swap(name, nil) // swap shard for nil
-				idx.shards.LoadAndDelete(name)          // then remove entry
+					return idx.shards.Load(name)
+				}()
 
-				if !ok || shard == nil {
+				if shard == nil {
 					return nil // shard already does not exist or inactive
 				}
 
+				idx.shardCreateLocks.Lock(name)
+				defer idx.shardCreateLocks.Unlock(name)
+
+				idx.shards.LoadAndDelete(name)
+
 				if err := shard.Shutdown(ctx); err != nil {
-					ec.Add(err)
-					idx.logger.WithField("action", "shutdown_shard").
-						WithField("shard", shard.ID()).Error(err)
+					if !errors.Is(err, errAlreadyShutdown) {
+						ec.Add(err)
+						idx.logger.WithField("action", "shutdown_shard").
+							WithField("shard", shard.ID()).Error(err)
+					}
+					m.logger.WithField("shard", shard.Name()).Debug("was already shut or dropped")
 				}
 				return nil
 			})
@@ -406,11 +418,11 @@ func (m *Migrator) ValidateVectorIndexConfigUpdate(
 	// to check, we can always use that an hnsw-specific validation should be
 	// used for now.
 	switch old.IndexType() {
-	case "hnsw":
+	case vectorindex.VectorIndexTypeHNSW:
 		return hnsw.ValidateUserConfigUpdate(old, updated)
-	case "flat":
+	case vectorindex.VectorIndexTypeFLAT:
 		return flat.ValidateUserConfigUpdate(old, updated)
-	case "dynamic":
+	case vectorindex.VectorIndexTypeDYNAMIC:
 		return dynamic.ValidateUserConfigUpdate(old, updated)
 	}
 	return fmt.Errorf("Invalid index type: %s", old.IndexType())
@@ -442,6 +454,16 @@ func (m *Migrator) UpdateInvertedIndexConfig(ctx context.Context, className stri
 	conf := inverted.ConfigFromModel(updated)
 
 	return idx.updateInvertedIndexConfig(ctx, conf)
+}
+
+func (m *Migrator) UpdateReplicationFactor(ctx context.Context, className string, factor int64) error {
+	idx := m.db.GetIndex(schema.ClassName(className))
+	if idx == nil {
+		return errors.Errorf("cannot update replication factor of non-existing index for %s", className)
+	}
+
+	idx.Config.ReplicationFactor.Store(factor)
+	return nil
 }
 
 func (m *Migrator) RecalculateVectorDimensions(ctx context.Context) error {

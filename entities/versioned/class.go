@@ -9,10 +9,13 @@
 //  CONTACT: hello@weaviate.io
 //
 
-package ent
+package versioned
 
-type VectorizationResult struct {
-	Text       string
-	Dimensions int
-	Vector     []float32
+import "github.com/weaviate/weaviate/entities/models"
+
+// Class is a wrapper on top of class created by OpenAPI to be able
+// to inject version to class
+type Class struct {
+	*models.Class
+	Version uint64
 }
