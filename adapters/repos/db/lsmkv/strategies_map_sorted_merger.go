@@ -29,28 +29,35 @@ func newSortedMapMerger() *sortedMapMerger {
 }
 
 func (s *sortedMapMerger) do(ctx context.Context, segments [][]MapPair) ([]MapPair, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	if err := s.init(segments); err != nil {
 		return nil, errors.Wrap(err, "init sorted map decoder")
 	}
 
 	i := 0
-	for {
-		if ctx.Err() != nil {
+	done := false
+	for !done {
+		select {
+		case <-ctx.Done():
 			return nil, ctx.Err()
-		}
+		default:
+			match, ok := s.findSegmentWithLowestKey()
+			if !ok {
+				done = true
+				break
+			}
 
-		match, ok := s.findSegmentWithLowestKey()
-		if !ok {
-			break
-		}
+			if match.Tombstone {
+				// the latest version of this key was a tombstone, so we can ignore it
+				continue
+			}
 
-		if match.Tombstone {
-			// the latest version of this key was a tombstone, so we can ignore it
-			continue
-		}
+			s.output[i] = match
+			i++
 
-		s.output[i] = match
-		i++
+		}
 	}
 
 	return s.output[:i], nil
